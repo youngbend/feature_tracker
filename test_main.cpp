@@ -1,12 +1,16 @@
 #include "tracker.h"
 #include <iostream>
 #include <opencv2/opencv.hpp>
+#include <chrono>
+#include <string>
 
 using namespace std;
 using namespace cv;
 
 int main(int argc, char** argv) {
-    Mat img = imread("../tracking_dark.jpg");
+    if (argc != 2) return  -1;
+    
+    Mat img = imread(argv[1]);
     if (img.empty()) {
         cout << "Could not find image!" << endl;
         return -1;
@@ -16,10 +20,15 @@ int main(int argc, char** argv) {
     Mat gray;
     cvtColor(img, gray, COLOR_RGB2GRAY);
 
-    Tracker tracker(4, 4, 5, 25, 15, 15);
+    Tracker tracker(2, 2, 6, 20, 15, 15);
 
-    tracker.scan(gray);
-    tracker.update_targets(gray);
+    using namespace std::chrono;
+    high_resolution_clock::time_point t1 = high_resolution_clock::now();
+    tracker.scan(gray, 3);
+    /* tracker.update_targets(gray); */
+    high_resolution_clock::time_point t2 = high_resolution_clock::now();
+    duration<double> time_span = duration_cast<duration<double>>(t2-t1);
+    cout << "Time taken to run: " << time_span.count() << " seconds" << endl;
 
     vector<point> centers = tracker.get_target_centers();
 

@@ -2,8 +2,10 @@
 #define TRACKER_H
 
 #include <vector>
+#include <list>
 #include <math.h>
 #include <numeric>
+#include <mutex>
 #include <opencv2/opencv.hpp>
 
 class Tracker;
@@ -16,17 +18,20 @@ struct point {
 class Target {
 public:
     Target(point center_in, int radius_in) : 
-        center(center_in), prev_center({-1,-1}), radius(radius_in), prev_radius(-1), loss_count(0) {}
+        center(center_in), prev_center({-1,-1}), radius(radius_in), prev_radius(-1), loss_count(0), dead(false) {}
     
     void update(point center_in, int radius_in) {
         prev_center = center;
         prev_radius = radius;
         loss_count = 0;
+        dead = false;
         center = center_in;
         radius = radius_in;
     }
 
     void lost() { loss_count++; }
+
+    void kill() { dead = true; }
 
     point get_center() { return center; }
 
@@ -38,6 +43,7 @@ protected:
     int radius;
     int prev_radius;
     int loss_count;
+    bool dead;
 };
 
 class Tracker {
@@ -46,11 +52,10 @@ public:
 
     std::vector<point> get_target_centers();
 
-    void scan(cv::Mat &image);
+    void scan(cv::Mat &image, int n_threads);
 
     void update_targets(cv::Mat &image);
 
-    bool pinpoint_target(cv::Mat &image, point start_loc, point &center, int &radius);
 private:
     int row_scan_offset;
     int col_scan_offset;
@@ -59,7 +64,13 @@ private:
     int tracking_offset;
     int tracking_timeout;
 
-    std::vector<Target> targets;
+    std::mutex target_lock;
+
+    std::list<Target> targets;
+
+    void scan_thread(cv::Mat &image, int lbound, int rbound);
+    void update_targets_thread(cv::Mat &image, Target &target);
+    bool pinpoint_target(cv::Mat &image, point start_loc, point &center, int &radius);
 };
 
 class TrackerException {

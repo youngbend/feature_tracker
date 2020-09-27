@@ -1,6 +1,7 @@
 #include "tracker.h"
 #include <iostream>
 #include <algorithm>
+#include <thread>
 
 using namespace std;
 
@@ -24,10 +25,8 @@ vector<point> Tracker::get_target_centers() {
     return centers;
 }
 
-void Tracker::scan(cv::Mat &image) {
+void Tracker::scan(cv::Mat &image, int n_threads) {
     // Update targets
-    if (image.channels() > 1) throw TrackerException("Error: Image must be grayscale");
-
     update_targets(image);
 
     for (auto iter = targets.begin(); iter != targets.end();) {
@@ -37,12 +36,43 @@ void Tracker::scan(cv::Mat &image) {
         else iter++;
     }
 
+    vector<thread> runners;
+    for (int i = 0; i < n_threads; ++i) {
+        runners.emplace_back(bind(&Tracker::scan_thread, this, image, i*(image.cols/n_threads), (i+1)*(image.cols/n_threads)));
+    }
+
+    for (int i = 0; i < runners.size(); ++i) {
+        runners[i].join();
+    }
+
+    return;
+}
+
+void Tracker::update_targets(cv::Mat &image) {
+    if (image.channels() > 1) throw TrackerException("Error: Image must be grayscale");
+    
+    vector<thread> runners;
+    for (auto t : targets) {
+        runners.emplace_back(bind(&Tracker::update_targets_thread, this, image, t));
+    }
+
+    for (int i = 0; i < runners.size(); i++) {
+        runners[i].join();
+    }
+
+    for (auto iter = targets.begin(); iter != targets.end();) {
+        if (iter->dead) iter = targets.erase(iter);
+        else iter++;
+    }
+}
+
+void Tracker::scan_thread(cv::Mat &image, int lbound, int rbound) {
+
     uint8_t *data = image.data;
     int stride = image.step;
 
-    cout << "Rows = " << image.rows << " Columns = " << image.cols << endl;
     for (int r = 0; r < image.rows; r += row_scan_offset) {
-        for (int c = col_scan_offset; c < image.cols; c += col_scan_offset) {
+        for (int c = lbound + col_scan_offset; c < rbound; c += col_scan_offset) {
             if (gradient(data[r * stride + c - col_scan_offset], data[r * stride + c]) > threshold) {
                 bool inside_target = false;
                 for (auto t : targets) {
@@ -62,78 +92,67 @@ void Tracker::scan(cv::Mat &image) {
                 int radius;
                 
                 if (pinpoint_target(image, {r,c}, center, radius)) {
+                    target_lock.lock();
                     targets.push_back(Target(center, radius));
+                    target_lock.unlock();
                     data[center.row * stride + center.col - col_scan_offset] = 255;
                 }
-                
+            }
+        }
+    }
+}
 
+void Tracker::update_targets_thread(cv::Mat &image, Target &target) {
+    uint8_t *data = image.data;
+    int stride = image.step;
+    
+    double row_offset = 0;
+    double col_offset = 0;
+    double depth_offset = 0;
+    double track_offset = tracking_offset;
+    if (target.prev_center.row != -1 && target.prev_center.col != -1) {
+        row_offset = target.center.row - target.prev_center.row;
+        col_offset = target.center.col - target.prev_center.col;
+        depth_offset = target.radius - target.prev_radius;
+        if (depth_offset < 0) depth_offset = 0;
+        if (target.loss_count) {
+            double interpolation_factor = 3.0 - 3.25 * exp(-target.loss_count / 2.0);
+            row_offset *= interpolation_factor;
+            col_offset *= interpolation_factor;
+            depth_offset *= interpolation_factor;
+            track_offset *= interpolation_factor;
+        }
+    }
+    else if (target.loss_count) tracking_offset *= 1.5;
+
+    int top = int(target.center.row - target.radius + row_offset - depth_offset - track_offset);
+    int bottom = int(target.center.row + target.radius + row_offset + depth_offset + track_offset);
+    int left = int(target.center.col - target.radius + col_offset - depth_offset - track_offset);
+    int right = int(target.center.col + target.radius + col_offset + depth_offset + track_offset);
+
+    if (top < 0 || left < 0 || bottom > image.rows || right > image.cols) {
+        target.kill();
+        return;
+    }
+
+    bool is_found = false;
+    point center;
+    int radius = 0;
+
+    for (int r = top; r < bottom; r += row_scan_offset) {
+        for (int c = left; c < right; c += col_scan_offset) {
+            if (gradient(data[r*stride+c-col_scan_offset], data[r*stride+c]) > threshold) {
+                if (pinpoint_target(image, {r,c}, center, radius)) {
+                    target.update(center, radius);
+                    return;
+                }
             }
         }
     }
 
-    return;
-}
-
-void Tracker::update_targets(cv::Mat &image) {
-    uint8_t *data = image.data;
-    int stride = image.step;
-    
-    for (auto t = targets.begin(); t != targets.end();) {
-        double row_offset = 0;
-        double col_offset = 0;
-        double depth_offset = 0;
-        double track_offset = tracking_offset;
-        if (t->prev_center.row != -1 && t->prev_center.col != -1) {
-            row_offset = t->center.row - t->prev_center.row;
-            col_offset = t->center.col - t->prev_center.col;
-            depth_offset = t->radius - t->prev_radius;
-            if (depth_offset < 0) depth_offset = 0;
-            if (t->loss_count) {
-                double interpolation_factor = 3.0 - 3.25 * exp(-t->loss_count / 2.0);
-                row_offset *= interpolation_factor;
-                col_offset *= interpolation_factor;
-                depth_offset *= interpolation_factor;
-                track_offset *= interpolation_factor;
-            }
-        }
-        else if (t->loss_count) tracking_offset *= 1.5;
-
-        int top = int(t->center.row - t->radius + row_offset - depth_offset - track_offset);
-        int bottom = int(t->center.row + t->radius + row_offset + depth_offset + track_offset);
-        int left = int(t->center.col - t->radius + col_offset - depth_offset - track_offset);
-        int right = int(t->center.col + t->radius + col_offset + depth_offset + track_offset);
-
-        if (top < 0 || left < 0 || bottom > image.rows || right > image.cols) {
-            t = targets.erase(t);
-            continue;
-        }
-
-        bool is_found = false;
-        point center;
-        int radius = 0;
-
-        for (int r = top; r < bottom; r += row_scan_offset) {
-            for (int c = left; c < right; c += col_scan_offset) {
-                if (gradient(data[r*stride+c-col_scan_offset], data[r*stride+c]) > threshold) {
-                    if (pinpoint_target(image, {r,c}, center, radius)) {
-                        is_found = true;
-                        break;
-                    }
-                }
-            }
-            if (is_found) break;
-        }
-
-        if (is_found) t->update(center, radius);
-        else {
-            t->lost();
-            if (t->loss_count >= tracking_timeout) {
-                t = targets.erase(t);
-                continue;
-            }
-        }
-
-        t++;
+    target.lost();
+    if (target.loss_count >= tracking_timeout) {
+        target.kill();
     }
 }
 
@@ -235,7 +254,7 @@ bool Tracker::pinpoint_target(cv::Mat &image, point start_loc, point &center, in
     
     if (top == -1 | bottom == -1 || vbar_bounds.size() != 4) return false;
 
-    if (abs((vbar_bounds[1] - vbar_bounds[0]) - (vbar_bounds[3] - vbar_bounds[2])) > target_offset) return false;
+    if (abs((vbar_bounds[1] - vbar_bounds[0]) - (vbar_bounds[3] - vbar_bounds[2])) > 2*target_offset) return false;
 
     double center_row = (top + bottom) / 2.0;
     double center_column = accumulate(vbar_bounds.begin(), vbar_bounds.end(), 0) / 4.0 + new_scan_offset_col;
@@ -328,7 +347,7 @@ bool Tracker::pinpoint_target(cv::Mat &image, point start_loc, point &center, in
 
     if (left == -1 || right == -1 || hbar_bounds.size() != 4) return false;
 
-    if (abs((hbar_bounds[1] - hbar_bounds[0]) - (hbar_bounds[3] - hbar_bounds[2])) > target_offset) return false;
+    if (abs((hbar_bounds[1] - hbar_bounds[0]) - (hbar_bounds[3] - hbar_bounds[2])) > 2*target_offset) return false;
 
     if (hbar_bounds[1] - hbar_bounds[0] > (right - left) / 2) return false;
 
@@ -350,7 +369,7 @@ bool Tracker::pinpoint_target(cv::Mat &image, point start_loc, point &center, in
     if (all_of(left_vec.begin(), left_vec.end(), [](double i) { return i == 0; })) return false;
     vector<double> left_unit = unitVec(left_vec);
 
-    if (abs(L2Norm(up_vec) - L2Norm(right_vec)) > 2 * target_offset) return false;
+    if (abs(L2Norm(up_vec) - L2Norm(right_vec)) > 3 * target_offset) return false;
 
     if (L2Norm(down_vec) < target_offset || L2Norm(left_vec) < target_offset) return false;
 
@@ -381,7 +400,7 @@ bool Tracker::pinpoint_target(cv::Mat &image, point start_loc, point &center, in
     center = {int(center_row), int(center_column)};
     radius = max(bottom - top, right - left) / 2;
 
-    cout << "Center at: (" << center_row << "," << center_column << ")" << " with radius = " << radius << endl;
+    // cout << "Center at: (" << center_row << "," << center_column << ")" << " with radius = " << radius << endl;
 
     return true;
 }
